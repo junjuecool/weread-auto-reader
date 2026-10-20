@@ -12,6 +12,142 @@ WeRead Bot 是一个易用的微信读书自动阅读机器人，通过模拟真
 
 感谢 [findmover/wxread](https://github.com/findmover/wxread) 提供思路和部分代码支持。
 
+---
+
+# 🧩 本 Fork 定制版使用指南
+
+> 本仓库是 [funnyzak/weread-bot](https://github.com/funnyzak/weread-bot) 的个人定制版本，只为做好一件事：**单账号、每天北京时间 09:00 自动模拟阅读 60 分钟、仅在失败时飞书通知，并在凭证失效时尽量自动恢复**。
+
+**定制点一览：**
+
+| 项目 | 配置 |
+|------|------|
+| 账号 | 单账号（使用网页版抓包的登录凭证） |
+| 运行时间 | 每天北京时间 09:00（GitHub Actions 定时，UTC 01:00） |
+| 单次时长 | 模拟阅读 60 分钟 |
+| 通知 | 仅失败时发送飞书通知（成功不打扰） |
+| 凭证自愈 | 运行中自动续期并回写，失效时告警附恢复指引（见下文） |
+
+---
+
+## 一、部署到 GitHub（约 5 分钟）
+
+### 第 1 步：Fork 本仓库
+
+点击仓库右上角 **Fork**，复制到自己的账户下。
+
+### 第 2 步：抓包获取登录凭证（约 1 分钟）
+
+只需要复制一条浏览器请求，全程不用装任何软件：
+
+1. 用电脑浏览器打开 **https://weread.qq.com** 并登录（微信扫码即可）
+2. 随便打开一本书，**翻一页**
+3. 按 **F12** 打开开发者工具，切换到顶部的 **网络（Network）** 标签
+4. 在过滤器输入框输入 `read`
+5. 再翻一页，在请求列表里点击 **`web/book/read`** 这一条
+6. 在它上面**右键 → Copy → Copy as cURL (bash)**（ Safari 用户需先在「设置 → 高级」打开开发菜单）
+
+> 复制到的内容形如：`curl 'https://weread.qq.com/web/book/read' -H 'Cookie: wr_skey=...' --data-raw '{...}'`，先随便粘贴到备忘录里，下一步用。
+
+### 第 3 步：配置 Secrets
+
+进入自己 Fork 的仓库 → **Settings → Secrets and variables → Actions  New repository secret**，按下表添加：
+
+| Secret 名称 | 必填 | 填什么 |
+|-------------|------|--------|
+| `WEREAD_CURL_STRING` | ✅ 必填 | 第 2 步抓到的 cURL 整段粘贴 |
+| `FEISHU_WEBHOOK_URL` | ✅ 必填 | 飞书群机器人 Webhook（见下方说明） |
+| `WEREAD_SECRET_SYNC_TOKEN` | ⭐ 强烈推荐 | 用于凭证自动回写的令牌（见下方说明），不配则失效时只能告警不能自动续期 |
+| `TARGET_DURATION` | ⬜ 可选 | 阅读分钟数，默认已经是 `60` |
+| `NOTIFICATION_ONLY_ON_FAILURE` | ⬜ 可选 | 默认已是仅失败通知（`true`） |
+
+**飞书 Webhook 获取（约 30 秒）**：飞书里建一个只有自己的群 → 群设置 → 群机器人 → 添加机器人 → **自定义机器人** → 复制给出的 Webhook 地址（形如 `https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx`）。
+
+**`WEREAD_SECRET_SYNC_TOKEN` 获取（约 1 分钟，强烈建议配上）**：GitHub 右上角头像 → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token → Repository access 只选本仓库 → Permissions 里把 **Secrets 设为 Read and write** → 生成后复制（`github_pat_` 开头），存为同名 Secret。
+
+### 第 4 步：启用定时任务
+
+Fork 的仓库定时任务是**默认关闭**的，需要手动打开一次：
+
+进入仓库 **Actions** 页 → 左侧 **Auto Reading Bot** → 点击 **"I understand my workflows, go ahead and enable them"** → 对定时触发点 **Enable**。
+
+> ⚠️ GitHub 规定：公开仓库 **60 天没有任何活动**，定时任务会被自动停用。每天 09:00 的正常运行即算活动，长期不用时记得手动触发一次。
+
+### 第 5 步：手动验证一次
+
+Actions → Auto Reading Bot → 右侧 **Run workflow** → 留空直接运行。约 60 分钟后回来，运行记录显示绿色对勾即成功；失败时飞书会收到带恢复指引的通知。
+
+---
+
+## 二、凭证失效怎么办（自动恢复机制）
+
+微信读书的登录凭证（Cookie）会过期，这是「有时候会失效」的根源。本 Fork 做了三层应对：
+
+1. **自动续期（每天静默进行）**
+   每次运行时，机器人会尝试刷新凭证。微信读书在翻页过程中有时会下发新的 Cookie，程序会**自动把新 Cookie 合并进凭证**，并在配了 `WEREAD_SECRET_SYNC_TOKEN` 的情况下**写回仓库 Secret**——下次运行用的就是最新的凭证，越跑越新。
+2. **彻底失效时快速失败 + 告警**
+   如果凭证已彻底过期（需要重新扫码那种），任务不会傻等 60 分钟，而是**几分钟内快速失败**，飞书通知里会附带一份 1 分钟恢复指南（就是上面第 2 步的抓包流程），照着做一次即可满血复活。
+3. **程序级异常告警**
+   网页接口变动、网络异常等导致任务跑不下去时，同样会发飞书通知，并在日志里保留细节。
+
+> 说明：机器人无法代替你扫码登录，所以「自动恢复」= 能续期的自动续期 + 不能续期的立刻告知并指引恢复。配上 PAT 后，日常基本无需再管。
+
+---
+
+## 三、本地运行（可选）
+
+```bash
+# 1. 安装依赖
+pip install -r requirements.txt
+
+# 2. 把抓包内容保存为 curl_command.txt（该文件已被 .gitignore 忽略，不会提交）
+cp curl_command.example.txt curl_command.txt   # 然后整体替换为真实抓包内容
+
+# 3. 先做两次校验（不会真发请求、不会发通知）
+python3 weread-bot.py --config config.yaml --validate-config
+python3 weread-bot.py --config config.yaml --dry-run
+
+# 4. 正式跑一次（默认 60 分钟）
+python3 weread-bot.py --config config.yaml
+```
+
+本地配置在 `config.yaml`：单账号、60 分钟、仅失败通知、飞书通道。
+
+---
+
+## 四、常见问题（FAQ）
+
+**Q：定时到点了没运行？**
+Fork 的定时默认关闭，去 Actions 页面对该工流点 Enable（见上面第 4 步）；另外 60 天无活动会被 GitHub 自动停用。
+
+**Q：成功时也会有通知吗？**
+不会。默认只在失败时通知，成功保持安静。想临时验证通知链路，可以把 `WEREAD_CURL_STRING` 改成一个错误值，触发一次失败通知。
+
+**Q：每天真的会跑满 60 分钟吗？**
+会。任务目标时长就是 60 分钟，阅读请求间隔 30~48 秒，全程约一百多次请求，和真人翻页节奏接近。工作流超时设置为 120 分钟，留足了余量。
+
+**Q：回写 Secret 会不会触发无限循环？**
+不会。更新 Secret 不会触发工作流运行。
+
+**Q：09:00 一定准时吗？**
+GitHub 定时在高峰期可能延迟几分钟到十几分钟，属正常现象。
+
+**Q：会封号吗？**
+有任何风险意识是好事：请见下方免责声明，建议低调使用、不要多设备同时刷。
+
+---
+
+## 五、免责声明
+
+本项目仅供学习与技术研究使用。使用自动化脚本积累阅读时长可能违反《微信读书用户协议》，并存在账号被风控、限制或封禁的风险，后果需自行承担。请遵守相关平台规则，理性使用。
+
+---
+
+## 附：上游完整文档
+
+下方是上游项目 `funnyzak/weread-bot` 的完整中文文档（含多用户、Docker、青龙面板等高级用法），本 Fork 未改动这些能力，可按需查阅。
+
+
 ## 适合哪些用户
 
 - 想在本地先快速跑通一个账号的个人用户

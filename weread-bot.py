@@ -90,6 +90,18 @@ CURRENT_USER = ContextVar("weread_user", default="system")
 CURRENT_SESSION_ID = ContextVar("weread_session_id", default="-")
 
 
+# fork 定制：凭证自愈模块（weread_cookie_healer）
+try:
+    import os as _os
+    import sys as _sys
+
+    _sys.path.insert(0, _os.path.dirname(_os.path.abspath(__file__)))
+    from weread_cookie_healer import CookieHealer, build_curl_with_cookies
+except Exception:  # pragma: no cover - 依赖缺失时降级为不可用
+    CookieHealer = None
+    build_curl_with_cookies = None
+
+
 class LogContextFilter(logging.Filter):
     """向日志记录注入并发安全的会话上下文。"""
 
@@ -1909,6 +1921,7 @@ class HttpClient:
             raise ImportError("缺少依赖 httpx，请先安装 requirements.txt")
         self.config = config
         self.request_times: List[float] = []
+        self.last_response = None
         self._rate_limiter = RateLimiter(config.rate_limit)
         self._client = httpx.AsyncClient(
             timeout=config.timeout,
@@ -1924,6 +1937,7 @@ class HttpClient:
         response, elapsed = await self._request_with_retries(
             url, headers=headers, cookies=cookies, json_data=data
         )
+        self.last_response = response
         return response.json(), elapsed
 
     async def post_raw(
@@ -3186,6 +3200,9 @@ class WeReadApplication:
             # 执行阅读会话
             session_result = await session_manager.start_reading_session()
 
+            sync_status = self._maybe_sync_cookies(session_manager)
+            if sync_status:
+                logging.info("🔁 凭证回写状态: %s", sync_status)
             logging.info("📊 会话统计:")
             logging.info(session_result.stats.get_statistics_summary())
             return RunResult.from_session_results([session_result])
@@ -3219,6 +3236,17 @@ class WeReadApplication:
                 )
             CURRENT_SESSION_ID.reset(session_token)
             CURRENT_USER.reset(user_token)
+
+    @classmethod
+    def _maybe_sync_cookies(cls, session_manager) -> str:
+        """fork 定制：尽力回写刷新后的凭证，失败不影响主流程。"""
+        if CookieHealer is None:
+            return ""
+        try:
+            return CookieHealer.sync_from_session(session_manager)
+        except Exception as exc:
+            logging.warning("⚠️ 凭证回写跳过: %s", exc)
+            return f"failed:{exc}"[:120]
 
     @classmethod
     async def _run_multi_user_sessions(cls, instance) -> RunResult:
@@ -3364,6 +3392,11 @@ class WeReadApplication:
 class WeReadSessionManager:
     """微信读书会话管理器"""
 
+    # fork 定制：凭证自愈状态（类级默认值，兼容测试中的轻量构造）
+    cookie_dirty: bool = False
+    cookie_renewals: int = 0
+    _curl_template: str = ""
+
     # 微信读书API常量
     KEY = "3c5c8717f3daf09iop3423zafeqoi"
     READ_URL = "https://weread.qq.com/web/book/read"
@@ -3420,6 +3453,10 @@ class WeReadSessionManager:
         self.data = self.DEFAULT_DATA.copy()
         self.session_user_agent = None  # 会话级别的User-Agent
         self._last_read_error_category = None
+        # fork 定制：凭证自愈状态
+        self.cookie_dirty = False
+        self.cookie_renewals = 0
+        self._curl_template = ""
 
         self._load_curl_config()
         self._initialize_session_user_agent()
@@ -3533,6 +3570,7 @@ class WeReadSessionManager:
                     )
                     self.reading_manager.set_curl_data("", "")
 
+                self._curl_template = curl_content
                 logging.info(f"✅ 用户 {self.user_name} CURL配置解析成功")
             except Exception as e:
                 logging.error(
@@ -3682,10 +3720,52 @@ class WeReadSessionManager:
                 return parts.split('=', 1)[1].strip()
         return None
 
+    def _capture_cookies_from_response(self, response) -> None:
+        """fork 定制：合并响应返回的新 Cookie，标记凭证是否变化。"""
+        if response is None:
+            return
+        merged: Dict[str, str] = {}
+        try:
+            jar = getattr(response, "cookies", None)
+            if jar:
+                merged.update({str(k): str(v) for k, v in dict(jar).items()})
+        except Exception:
+            pass
+        try:
+            set_cookie = response.headers.get("set-cookie", "")
+        except Exception:
+            set_cookie = ""
+        for segment in set_cookie.split(","):
+            first = segment.split(";", 1)[0].strip()
+            if "=" in first:
+                name, value = first.split("=", 1)
+                merged[name.strip()] = value.strip()
+        changed = {
+            name: value for name, value in merged.items()
+            if self.cookies.get(name) != value
+        }
+        if not changed:
+            return
+        self.cookies.update(merged)
+        self.cookie_dirty = True
+        logging.info("🔐 会话凭证更新: %s", ", ".join(sorted(changed)))
+
+    def export_refreshed_curl(self) -> Optional[str]:
+        """fork 定制：导出带最新 Cookie 的 CURL（仅在确实刷新过时）。"""
+        if not self.cookie_dirty or self.cookie_renewals <= 0:
+            return None
+        template = self._curl_template
+        if not template or build_curl_with_cookies is None:
+            return None
+        return build_curl_with_cookies(template, self.cookies)
+
     async def _handle_protocol_response(
         self, response_data: Dict[str, Any], response_time: float
     ) -> Tuple[bool, float]:
         """集中处理阅读接口响应中的协议兼容分支"""
+        self._capture_cookies_from_response(
+            getattr(self.http_client, "last_response", None)
+        )
         if is_successful_read_response(response_data):
             logging.debug(
                 "阅读请求成功，响应字段: %s",
@@ -3926,8 +4006,12 @@ class WeReadSessionManager:
                     event=NotificationEvent.SESSION_SUCCESS,
                 )
             elif result.status == SessionStatus.FAILED:
+                message = result.message or "阅读会话失败"
+                if (result.error_category == RuntimeErrorCategory.AUTH
+                        and CookieHealer is not None):
+                    message = f"{message}\n\n{CookieHealer.repair_guide_text()}"
                 await self.notification_service.send_notification_async(
-                    result.message or "阅读会话失败",
+                    message,
                     event=NotificationEvent.SESSION_FAILURE,
                 )
         except Exception as exc:
@@ -4069,7 +4153,11 @@ class WeReadSessionManager:
                 )
                 continue
 
+            if self.cookies.get('wr_skey') != new_skey:
+                self.cookie_dirty = True
             self.cookies['wr_skey'] = new_skey
+            self.cookie_renewals += 1
+            self._capture_cookies_from_response(response)
             logging.info(
                 "✅ Cookie刷新成功，ql=%s，新密钥: %s",
                 ql_value,
