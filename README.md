@@ -32,9 +32,17 @@ WeRead Bot 是一个易用的微信读书自动阅读机器人，通过模拟真
 
 ## 一、部署到 GitHub（约 5 分钟）
 
-### 第 1 步：Fork 本仓库
+### 第 1 步：Fork 本仓库并推送本地定制代码
 
-点击仓库右上角 **Fork**，复制到自己的账户下。
+1. 打开 https://github.com/funnyzak/weread-bot ，点击右上角 **Fork**，复制到自己的账户下
+2. 在本地仓库目录执行下面两条命令（把 `你的用户名` 换成自己的 GitHub 用户名），把定制代码推上去：
+
+```bash
+git remote add origin https://github.com/你的用户名/weread-bot.git
+git push -u origin main
+```
+
+> 本 Fork 的修复和定制都在本地 `main` 分支上，必须推送后 GitHub 上的仓库才会包含它们。
 
 ### 第 2 步：抓包获取登录凭证（约 1 分钟）
 
