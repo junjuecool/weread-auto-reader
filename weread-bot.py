@@ -179,6 +179,41 @@ def _secret_marker(value: Any) -> str:
     return f"[REDACTED:{digest}]"
 
 
+# 占位符/未配置 webhook 的常见标记（匹配时大小写不敏感）
+PLACEHOLDER_WEBHOOK_MARKERS = (
+    "请替换",
+    "your_webhook",
+    "your-webhook",
+    "example",
+    "placeholder",
+    "todo",
+    "此处",
+    "填入",
+    "xxx",
+)
+
+# 各通知渠道的合法 webhook 前缀
+WEBHOOK_URL_PREFIXES = {
+    "飞书": "https://open.feishu.cn/open-apis/bot/v2/hook/",
+}
+
+
+def is_placeholder_webhook(url: str, service_name: str) -> bool:
+    """判断 webhook 是否为占位符或明显非法的地址。
+
+    占位地址直接判定为失败，避免把「未配置」误报成「发送成功」。
+    """
+    if not url:
+        return True
+    lowered = url.lower()
+    if any(marker.lower() in lowered for marker in PLACEHOLDER_WEBHOOK_MARKERS):
+        return True
+    prefix = WEBHOOK_URL_PREFIXES.get(service_name)
+    if prefix and not url.startswith(prefix):
+        return True
+    return False
+
+
 def redact_for_log(value: Any) -> Any:
     """递归脱敏日志数据，不保留密钥原始前缀。"""
     if isinstance(value, dict):
@@ -2745,6 +2780,12 @@ class NotificationService:
         if not config.get("webhook_url"):
             logging.error("❌ 飞书Webhook URL未配置")
             return False
+        if is_placeholder_webhook(config["webhook_url"], "飞书"):
+            logging.error(
+                "❌ 飞书Webhook URL为占位符或格式非法，"
+                "请在 config.yaml 或环境变量 FEISHU_WEBHOOK_URL 中填写真实地址"
+            )
+            return False
 
         # 飞书支持两种消息格式：text和rich_text
         msg_type = config.get("msg_type", "text")
@@ -3200,7 +3241,7 @@ class WeReadApplication:
             # 执行阅读会话
             session_result = await session_manager.start_reading_session()
 
-            sync_status = self._maybe_sync_cookies(session_manager)
+            sync_status = cls._maybe_sync_cookies(session_manager)
             if sync_status:
                 logging.info("🔁 凭证回写状态: %s", sync_status)
             logging.info("📊 会话统计:")

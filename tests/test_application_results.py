@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 import signal
 from argparse import Namespace
@@ -71,6 +72,44 @@ class ApplicationResultTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.final_status, "failed")
         self.assertEqual(result.exit_code, 1)
+
+    async def test_single_user_success_session_syncs_cookies(self):
+        """成功会话的凭证回写不得因 cls/self 误用而崩溃。
+
+        回归测试：_run_single_user_session 是 classmethod，
+        内部调用 _maybe_sync_cookies 必须使用 cls 而不是 self。
+        """
+        config = self.bot.WeReadConfig()
+        app = object.__new__(self.bot.WeReadApplication)
+        app.config = config
+        app.execution_type = "normal"
+        app._shutdown_event = asyncio.Event()
+        self.bot.WeReadApplication._instance = app
+        session_result = self.bot.SessionResult(
+            self.bot.SessionStatus.SUCCESS,
+            self.bot.ReadingSession(user_name="default", successful_reads=3),
+        )
+        fake_manager = unittest.mock.MagicMock()
+        fake_manager.start_reading_session = AsyncMock(return_value=session_result)
+        sync_calls = []
+
+        def fake_sync(cls_arg, manager):
+            sync_calls.append(manager)
+            return ""
+
+        with (
+            patch.object(self.bot, "WeReadSessionManager", return_value=fake_manager),
+            patch.object(
+                self.bot.WeReadApplication,
+                "_maybe_sync_cookies",
+                classmethod(fake_sync),
+            ),
+        ):
+            result = await self.bot.WeReadApplication._run_single_user_session(app)
+
+        self.assertEqual(result.final_status, "success")
+        self.assertEqual(result.exit_code, 0)
+        self.assertEqual(sync_calls, [fake_manager])
 
     async def test_main_returns_run_result_exit_code(self):
         config = self.bot.WeReadConfig(curl_content="safe")

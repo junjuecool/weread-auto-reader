@@ -55,7 +55,9 @@ reading:
   # 连续阅读请求失败多少次后结束当前用户会话；环境变量：MAX_CONSECUTIVE_FAILURES
   max_consecutive_failures: 5
   
-  # 书籍配置列表
+  # 书籍配置列表（CURL 凭证不可用时的兜底；单账号 + CURL 优先场景可留空 books: []）
+  # ⚠️ 以下书籍仅为格式演示，章节并不存在：smart_random 模式切到这些书时阅读会失败。
+  #    如需兜底书，请填写自己书架上真实可读的 book_id / chapter_id。
   # 章节索引优先级：配置的索引值 > CURL提取的值 > 自动计算的索引
   books:
     - name: "明朝那些事"                    # 书籍名称
