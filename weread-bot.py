@@ -3333,6 +3333,12 @@ class WeReadApplication:
                     )
                     WeReadApplication._current_session_managers.add(session_manager)
                     session_result = await session_manager.start_reading_session()
+                    # fork 定制：多用户路径同样回写刷新后的凭证，
+                    # 保证 GitHub Actions（WEREAD_CURL_STRING 走多用户路径）
+                    # 的凭证自愈生效
+                    sync_status = cls._maybe_sync_cookies(session_manager)
+                    if sync_status:
+                        logging.info("🔁 凭证回写状态: %s", sync_status)
                     logging.info(f"📊 用户 {user_config.name} 会话统计:")
                     logging.info(session_result.stats.get_statistics_summary())
                     return user_config.name, session_result
