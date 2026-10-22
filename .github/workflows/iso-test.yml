@@ -1,0 +1,10 @@
+name: ISO Test
+
+on:
+  workflow_dispatch:
+
+jobs:
+  iso:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "iso test ok"
