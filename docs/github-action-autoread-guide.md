@@ -187,7 +187,7 @@ curl 'https://weread.qq.com/web/book/read' -H 'cookie: wr_skey=user2; ...' --dat
 
 #### 定时触发（可选）
 
-Fork 后默认不会自动定时运行，因为仓库中的 `.github/workflows/auto-reading.yml` 仍然把 `schedule` 注释掉了。若希望自动定时运行，必须先取消该注释，再按需要调整 cron 表达式：
+Fork 后默认不会自动定时运行，因为仓库中的 `.github/workflows/weread-auto-reading.yml` 仍然把 `schedule` 注释掉了。若希望自动定时运行，必须先取消该注释，再按需要调整 cron 表达式：
 
 ```yaml
 on:
@@ -218,7 +218,7 @@ on:
 | `history_enabled` | `true` | 是否启用执行历史持久化 |
 | `history_max_entries` | `50` | 执行历史最多保留多少条 |
 
-当在 GitHub Actions 中手动触发 `auto-reading.yml` 时，可以直接在界面填写 `target_duration` 覆盖本次阅读时长；若留空，则 workflow 会优先读取仓库 Secret `TARGET_DURATION`，再回退到默认值 `1-2`。这对 fork 后不想改 workflow 代码、但想给定时任务设置默认时长的场景尤其有用。
+当在 GitHub Actions 中手动触发 `weread-auto-reading.yml` 时，可以直接在界面填写 `target_duration` 覆盖本次阅读时长；若留空，则 workflow 会优先读取仓库 Secret `TARGET_DURATION`，再回退到默认值 `1-2`。这对 fork 后不想改 workflow 代码、但想给定时任务设置默认时长的场景尤其有用。
 
 同时，你也可以直接在界面勾选以上两个通知开关：`notify_enabled` 控制是否生成阅读成功摘要，`notify_only_on_failure` 则对应 `config.yaml` 中的 `notification.only_on_failure`，会自动关闭 `session_success` 和 `multi_user_summary` 两类成功事件，仅保留失败/异常通知。
 
@@ -301,7 +301,7 @@ A: 是的，GitHub 免费账户每月有 2000 分钟的 Actions 使用时间。�
 
 ### Q: 如何设置定时运行？
 
-A: 先取消 `.github/workflows/auto-reading.yml` 中 `schedule` 部分的注释，并根据需要调整 cron 表达式。注意时间为 UTC 时间。如果你 fork 后不想继续改代码，但想调整默认阅读时长，可以额外配置仓库 Secret `TARGET_DURATION`，例如 `5-10`。
+A: 先取消 `.github/workflows/weread-auto-reading.yml` 中 `schedule` 部分的注释，并根据需要调整 cron 表达式。注意时间为 UTC 时间。如果你 fork 后不想继续改代码，但想调整默认阅读时长，可以额外配置仓库 Secret `TARGET_DURATION`，例如 `5-10`。
 
 ### Q: GitHub Actions 里的执行历史保存在哪里？
 

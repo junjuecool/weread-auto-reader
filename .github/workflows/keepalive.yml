@@ -1,7 +1,7 @@
 name: Keepalive
 
 # 作用：定期向仓库写入一个空提交，产生"仓库活动"，
-# 避免 GitHub 因 60 天无活动自动禁用定时工作流（auto-reading）。
+# 避免 GitHub 因 60 天无活动自动禁用定时工作流（weread-auto-reading）。
 # 说明：workflow 文件不属运行时代码，符合 AGENTS.md 约束。
 
 on:

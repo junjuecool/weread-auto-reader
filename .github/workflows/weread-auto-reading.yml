@@ -11,7 +11,7 @@ on:
     paths:
       - 'weread-bot.py'
       - 'requirements.txt'
-      - '.github/workflows/auto-reading.yml'
+      - '.github/workflows/weread-auto-reading.yml'
       - '.github/workflows/ci.yml'
 
   # 手动触发

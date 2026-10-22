@@ -1,6 +1,6 @@
 # WeRead Bot: 微信读书阅读机器人
 
-[![Auto Reading Bot](https://img.shields.io/github/actions/workflow/status/funnyzak/weread-bot/auto-reading.yml?style=flat-square&label=Auto%20Reading)](https://github.com/funnyzak/weread-bot/actions/workflows/auto-reading.yml)
+[![Auto Reading Bot](https://img.shields.io/github/actions/workflow/status/junjuecool/weread-bot/weread-auto-reading.yml?style=flat-square&label=Auto%20Reading)](https://github.com/junjuecool/weread-bot/actions/workflows/weread-auto-reading.yml)
 [![Docker Tags](https://img.shields.io/docker/v/funnyzak/weread-bot?sort=semver&style=flat-square&label=docker%20image)](https://hub.docker.com/r/funnyzak/weread-bot/)
 [![Commit activity](https://img.shields.io/github/commit-activity/m/funnyzak/weread-bot?style=flat-square)](https://hub.docker.com/r/funnyzak/weread-bot/)
 [![Python](https://img.shields.io/badge/python-3.9+-blue?style=flat-square)](https://www.python.org/)

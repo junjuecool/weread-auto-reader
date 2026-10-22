@@ -232,7 +232,7 @@ class ConfigValidationTests(unittest.TestCase):
             Path(__file__).resolve().parents[1]
             / ".github"
             / "workflows"
-            / "auto-reading.yml"
+            / "weread-auto-reading.yml"
         )
 
         workflow = workflow_path.read_text(encoding="utf-8")
