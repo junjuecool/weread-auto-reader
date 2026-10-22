@@ -71,7 +71,9 @@ git push -u origin main
 
 **飞书 Webhook 获取（约 30 秒）**：飞书里建一个只有自己的群 → 群设置 → 群机器人 → 添加机器人 → **自定义机器人** → 复制给出的 Webhook 地址（形如 `https://open.feishu.cn/open-apis/bot/v2/hook/xxxxxxxx`）。
 
-**`WEREAD_SECRET_SYNC_TOKEN` 获取（约 1 分钟，强烈建议配上）**：GitHub 右上角头像 → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token → Repository access 只选本仓库 → Permissions 里把 **Secrets 设为 Read and write** → 生成后复制（`github_pat_` 开头），存为同名 Secret。
+**`WEREAD_SECRET_SYNC_TOKEN` 获取（约 1 分钟，强烈建议配上）**：GitHub 右上角头像 → Settings → Developer settings → Personal access tokens → **Tokens (classic)** → **Generate new token (classic)** → Note 随意填（如 `weread-bot`）→ Expiration 选 **No expiration**（避免续期令牌哪天过期后，自动续期悄悄失效）→ 勾选 **`repo`** 与 **`workflow`** 两项权限 → 底部 **Generate token** → 复制生成的令牌（`ghp_` 开头），存为同名 Secret。
+
+> 🔐 安全说明：GitHub 的 Secret 回写接口要求这种"能访问仓库"的令牌，因此它不止能操作本仓库。请务必：只在可信设备创建、只存入本仓库 Secret、绝不外发或写进代码。若暂不配它，机器人仍会每天阅读，只是凭证彻底过期时无法自动续期，只能发飞书告警等你手动抓包。
 
 ### 第 4 步：启用定时任务
 
@@ -79,11 +81,11 @@ Fork 的仓库定时任务是**默认关闭**的，需要手动打开一次：
 
 进入仓库 **Actions** 页 → 左侧 **Auto Reading Bot** → 点击 **"I understand my workflows, go ahead and enable them"** → 对定时触发点 **Enable**。
 
-> ⚠️ GitHub 规定：公开仓库 **60 天没有任何活动**，定时任务会被自动停用。每天 09:00 的正常运行即算活动，长期不用时记得手动触发一次。
+> ⚠️ GitHub 规定：公开仓库 **60 天没有任何"仓库活动"**（如提交、Issue），定时任务会被自动停用。**关键：光靠每天 09:00 的阅读运行并不算活动**——阅读运行不产生任何提交，这正是本机器人此前被悄悄停用的原因。本 Fork 已内置 **Keepalive** 工作流，每周一自动做一次空提交来保持活跃，正常情况下无需再管；只有长期（超过约 60 天）连 Keepalive 都没成功运行时，才需要去 Actions 页面对应工作流点 **Enable**。
 
 ### 第 5 步：手动验证一次
 
-Actions → Auto Reading Bot → 右侧 **Run workflow** → 留空直接运行。约 60 分钟后回来，运行记录显示绿色对勾即成功；失败时飞书会收到带恢复指引的通知。
+Actions → **Auto Reading Bot** → 右侧 **Run workflow** → 「阅读时长」可先填 `2` 做一次 2 分钟快速验证（留空则按 Secret/默认 60 分钟）→ **Run workflow**。运行结束显示绿色对勾、日志里有阅读/翻页记录即成功；失败时飞书会收到带恢复指引的通知。
 
 ---
 
@@ -126,7 +128,7 @@ python3 weread-bot.py --config config.yaml
 ## 四、常见问题（FAQ）
 
 **Q：定时到点了没运行？**
-Fork 的定时默认关闭，去 Actions 页面对该工流点 Enable（见上面第 4 步）；另外 60 天无活动会被 GitHub 自动停用。
+Fork 的定时默认关闭，去 Actions 页面对该工流点 Enable（见上面第 4 步）；另外 60 天无"仓库活动"会被 GitHub 自动停用（阅读运行本身不算活动，已由 Keepalive 工作流每周兜底保持活跃）。
 
 **Q：成功时也会有通知吗？**
 不会。默认只在失败时通知，成功保持安静。想临时验证通知链路，可以把 `WEREAD_CURL_STRING` 改成一个错误值，触发一次失败通知。
