@@ -1,0 +1,25 @@
+name: ISO Test 2
+
+on:
+  schedule:
+    - cron: '0 1 * * *'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'weread-bot.py'
+      - 'requirements.txt'
+      - '.github/workflows/auto-reading.yml'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+    inputs:
+      target_duration:
+        description: 'test'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  iso2:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "iso2 ok"
