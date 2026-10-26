@@ -56,8 +56,6 @@ jobs:
   auto-reading:
     runs-on: ubuntu-latest
     timeout-minutes: 120  # 2小时超时
-    permissions:
-      contents: write   # 保活步骤需要推送空提交
 
     steps:
     - name: Checkout code
@@ -224,24 +222,6 @@ jobs:
 
         # 运行阅读机器人
         python weread-bot.py --config config.yaml
-
-    - name: Keep scheduled workflow alive
-      # GitHub 在仓库 60 天无活动时会自动停用 schedule；这里定期留一次提交保活
-      if: always()
-      continue-on-error: true
-      run: |
-        last=$(git log -1 --format=%ct)
-        now=$(date +%s)
-        age=$(( (now - last) / 86400 ))
-        echo "最近一次提交距今 ${age} 天"
-        if [ "$age" -lt 25 ]; then
-          echo "25 天内有提交，跳过保活"
-          exit 0
-        fi
-        git config user.name "github-actions[bot]"
-        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-        git commit --allow-empty -m "chore: keepalive $(date -u +%Y-%m-%d)"
-        git push
 
     - name: Upload runtime artifacts
       if: always()
