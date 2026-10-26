@@ -1,0 +1,232 @@
+name: Reading Guardian
+
+# 自愈闭环：阅读任务失败时自动判断原因并重试；连续失败才告警（GitHub Issue）。
+# 不需要飞书、不需要本机开机，跑在 GitHub 自己的机器上。
+
+on:
+  workflow_run:
+    workflows: ["Auto Reading Bot"]
+    types: [completed]
+  schedule:
+    # 北京时间 10:05 云端兜底：当天没跑过就补触发（本机看门狗 09:50 也在做同样的事）
+    - cron: '5 2 * * *'
+  workflow_dispatch:
+    inputs:
+      test_alert:
+        description: '只测试告警通道（建 issue 后立刻关闭）'
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+  contents: read
+  issues: write
+
+env:
+  TZ: Asia/Shanghai
+
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          EVENT: ${{ github.event_name }}
+          CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+          FAILED_RUN: ${{ github.event.workflow_run.id }}
+          TEST_ALERT: ${{ inputs.test_alert }}
+          FEISHU: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        run: |
+          python3 - <<'PY'
+          import io, json, os, re, sys, time, urllib.error, urllib.request, zipfile
+          from datetime import datetime, timedelta, timezone
+
+          REPO = os.environ["REPO"]
+          TOKEN = os.environ["GH_TOKEN"]
+          EVENT = os.environ["EVENT"]
+          CONCLUSION = (os.environ.get("CONCLUSION") or "").strip()
+          FAILED_RUN = (os.environ.get("FAILED_RUN") or "").strip()
+          TEST_ALERT = (os.environ.get("TEST_ALERT") or "").lower() == "true"
+          FEISHU = (os.environ.get("FEISHU") or "").strip()
+          API = "https://api.github.com"
+          TZ = timezone(timedelta(hours=8))
+          ALERT_TITLE = "⚠️ 微信读书自动阅读失败"
+          MAX_RUNS_PER_DAY = 3
+
+          def log(msg):
+              print(msg, flush=True)
+
+          def api(method, path, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(API + path, data=data, method=method)
+              req.add_header("Authorization", "Bearer " + TOKEN)
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("X-GitHub-Api-Version", "2022-11-28")
+              req.add_header("Content-Type", "application/json")
+              req.add_header("User-Agent", "weread-guardian")
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as r:
+                      raw = r.read()
+                      return r.status, (json.loads(raw) if raw else {})
+              except urllib.error.HTTPError as e:
+                  raw = e.read()
+                  try:
+                      return e.code, (json.loads(raw) if raw else {})
+                  except ValueError:
+                      return e.code, {"raw": raw[:200].decode("utf-8", "replace")}
+              except Exception as e:
+                  return 0, {"error": str(e)}
+
+          def scrub(text):
+              text = re.sub(r"\x1b\[[0-9;]*m", "", text)
+              text = re.sub(r"(wr_skey|wr_vid|wr_rt|wr_gid|skey|vid)=([^;&\s]+)", r"\1=***", text)
+              text = re.sub(r"gh[pousr]_[A-Za-z0-9]{20,}", "***", text)
+              text = re.sub(r"(Bearer|token)\s+[A-Za-z0-9_\-\.]{20,}", r"\1 ***", text)
+              text = re.sub(r"(?:https?://)?(?:open\.feishu\.cn|larksuite\.com)/\S+", "***", text)
+              text = re.sub(r"\d{4}-\d{2}-\d{2}T[\d:.]+Z\s*", "", text)
+              return text
+
+          def today_runs():
+              code, data = api("GET", f"/repos/{REPO}/actions/workflows/weread-auto-reading.yml/runs?per_page=30")
+              if code != 200:
+                  return None, code
+              out = []
+              for r in data.get("workflow_runs", []):
+                  try:
+                      dt = datetime.strptime(r["created_at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+                  except (KeyError, ValueError):
+                      continue
+                  if dt.astimezone(TZ).date() == datetime.now(TZ).date():
+                      out.append(r)
+              return out, 200
+
+          def failed_log(run_id):
+              req = urllib.request.Request(f"{API}/repos/{REPO}/actions/runs/{run_id}/logs")
+              req.add_header("Authorization", "Bearer " + TOKEN)
+              req.add_header("Accept", "application/vnd.github+json")
+              req.add_header("User-Agent", "weread-guardian")
+              try:
+                  with urllib.request.urlopen(req, timeout=60) as r:
+                      blob = r.read()
+                  zf = zipfile.ZipFile(io.BytesIO(blob))
+                  chunks = []
+                  for name in zf.namelist():
+                      if name.endswith(".txt"):
+                          chunks.append(zf.read(name).decode("utf-8", "replace"))
+                  return "\n".join(chunks)
+              except Exception as e:
+                  return f"(取日志失败: {e})"
+
+          def classify(log_text):
+              low = log_text.lower()
+              if any(k in log_text for k in ("CURL 配置验证失败", "登录态", "未登录", "wr_skey 无效", "Cookie 已失效")):
+                  return "credential"
+              if "429" in low or "too many requests" in low or "rate limit" in low:
+                  return "ratelimit"
+              if any(k in low for k in ("timed out", "timeout", "connection reset", "temporary failure", "ssl")):
+                  return "network"
+              return "unknown"
+
+          def feishu(text):
+              if not (FEISHU and FEISHU.isascii() and len(FEISHU) >= 60 and "/hook/" in FEISHU):
+                  return False
+              payload = json.dumps({"msg_type": "text", "content": {"text": text}}).encode()
+              req = urllib.request.Request(FEISHU, data=payload, headers={"Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as r:
+                      body = r.read().decode("utf-8", "replace").replace(" ", "")
+                      return r.status == 200 and ('"code":0' in body or '"StatusCode":0' in body)
+              except Exception:
+                  return False
+
+          def open_alert(body):
+              code, data = api("GET", f"/repos/{REPO}/issues?state=open&per_page=30")
+              if code == 200:
+                  for it in data:
+                      if it.get("title") == ALERT_TITLE and "pull_request" not in it:
+                          c2, _ = api("POST", f"/repos/{REPO}/issues/{it['number']}/comments", {"body": body})
+                          log(f"已追加到告警 issue #{it['number']} HTTP {c2}")
+                          return it["number"]
+              code, data = api("POST", f"/repos/{REPO}/issues", {"title": ALERT_TITLE, "body": body})
+              if code == 201:
+                  log(f"已创建告警 issue #{data['number']}")
+                  return data["number"]
+              log(f"创建告警 issue 失败 HTTP {code}: {str(data)[:200]}")
+              return None
+
+          def close_alerts(note):
+              code, data = api("GET", f"/repos/{REPO}/issues?state=open&per_page=30")
+              if code != 200:
+                  return
+              for it in data:
+                  if it.get("title") == ALERT_TITLE and "pull_request" not in it:
+                      api("POST", f"/repos/{REPO}/issues/{it['number']}/comments", {"body": note})
+                      api("PATCH", f"/repos/{REPO}/issues/{it['number']}", {"state": "closed"})
+                      log(f"已关闭告警 issue #{it['number']}")
+
+          if TEST_ALERT:
+              n = open_alert("这是告警通道自检，收到后会自动关闭。")
+              if n:
+                  api("PATCH", f"/repos/{REPO}/issues/{n}", {"state": "closed"})
+                  log("自检完成，issue 已关闭")
+              sys.exit(0)
+
+          # 1) 成功路径：顺手关掉历史告警
+          if EVENT == "workflow_run" and CONCLUSION == "success":
+              close_alerts("✅ 后续运行已成功，自动关闭该告警。")
+              sys.exit(0)
+
+          # 2) 判断今天的状态
+          runs, code = today_runs()
+          if runs is None:
+              log(f"查询运行记录失败 HTTP {code}")
+              sys.exit(1)
+          active = [r for r in runs if r.get("status") in ("queued", "in_progress", "waiting", "requested", "pending")]
+          success = [r for r in runs if r.get("status") == "completed" and r.get("conclusion") == "success"]
+
+          if EVENT == "schedule" or EVENT == "workflow_dispatch":
+              if active:
+                  log(f"今日已有运行中的任务 #{active[0]['id']}，跳过")
+                  sys.exit(0)
+              if success:
+                  log(f"今日已有成功运行 #{success[0]['id']}，跳过")
+                  sys.exit(0)
+              if len(runs) >= MAX_RUNS_PER_DAY:
+                  log(f"今日已运行 {len(runs)} 次且未成功，不再补触发")
+                  open_alert(f"今日已自动重试 {len(runs)} 次仍未成功，已停止自动重试，需要人工介入。\n仓库：{REPO}")
+                  sys.exit(0)
+              log(f"今日尚无成功运行，补触发（今日第 {len(runs) + 1} 次）")
+              code, data = api("POST", f"/repos/{REPO}/actions/workflows/weread-auto-reading.yml/dispatches", {"ref": "main"})
+              if code == 204:
+                  log("补触发成功")
+              else:
+                  log(f"补触发失败 HTTP {code}: {str(data)[:200]}")
+              sys.exit(0 if code == 204 else 1)
+
+          # 3) workflow_run 失败路径
+          if len(runs) >= MAX_RUNS_PER_DAY:
+              tail = scrub(failed_log(FAILED_RUN))[-3000:] if FAILED_RUN else ""
+              kind = classify(tail)
+              body = (f"今天的自动阅读已尝试 {len(runs)} 次仍未成功，自动重试停止。\n\n"
+                      f"**疑似原因**：{kind}\n\n"
+                      f"**最后一次日志尾部（已脱敏）**\n```\n{tail}\n```\n")
+              open_alert(body)
+              feishu(f"⚠️ 微信读书自动阅读今天连续失败 {len(runs)} 次，疑似原因：{kind}。详见仓库 Issue。")
+              sys.exit(0)
+
+          tail = scrub(failed_log(FAILED_RUN))[-3000:] if FAILED_RUN else ""
+          kind = classify(tail)
+          log(f"失败分类：{kind}；今日已运行 {len(runs)} 次，准备重试")
+          time.sleep(60)
+          code, data = api("POST", f"/repos/{REPO}/actions/workflows/weread-auto-reading.yml/dispatches", {"ref": "main"})
+          if code == 204:
+              log(f"已自动重试（今日第 {len(runs) + 1} 次）")
+              feishu(f"🔁 微信读书自动阅读失败（{kind}），已自动重试。")
+              sys.exit(0)
+          log(f"重试触发失败 HTTP {code}: {str(data)[:200]}")
+          open_alert(f"自动重试触发失败（HTTP {code}），需要人工介入。\n\n```\n{tail}\n```")
+          sys.exit(1)
+          PY
