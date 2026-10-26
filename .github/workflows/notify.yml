@@ -1,4 +1,7 @@
 name: Feishu Notify
+
+# 供本机看门狗（~/.weread-watchdog/watchdog.py）调用：
+# 本机到 open.feishu.cn 的 TLS 常被中间人拦截，改由 GitHub Actions 代发。
 on:
   workflow_dispatch:
     inputs:
@@ -6,9 +9,14 @@ on:
         description: '要发送到飞书的文本'
         required: true
         type: string
+
+permissions:
+  contents: read
+
 jobs:
   notify:
     runs-on: ubuntu-latest
+    timeout-minutes: 5
     steps:
       - name: Send to Feishu
         env:
@@ -16,11 +24,51 @@ jobs:
           MESSAGE: ${{ inputs.message }}
         run: |
           python3 - <<'PY'
-          import os, json, urllib.request
-          url = os.environ["WEBHOOK"]
-          text = os.environ["MESSAGE"]
-          data = json.dumps({"msg_type": "text", "content": {"text": text}}).encode("utf-8")
-          req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
-          with urllib.request.urlopen(req, timeout=20) as resp:
-              print("feishu status", resp.status, resp.read().decode("utf-8", "replace")[:200])
+          import json, os, sys, time, urllib.request
+
+          url = (os.environ.get("WEBHOOK") or "").strip()
+          text = (os.environ.get("MESSAGE") or "").strip() or "（空消息）"
+
+          problems = []
+          if not url:
+              problems.append("Secret FEISHU_WEBHOOK_URL 为空")
+          else:
+              if not url.startswith("https://"):
+                  problems.append("不是以 https:// 开头")
+              if not url.isascii():
+                  bad = [i for i, ch in enumerate(url) if ord(ch) > 127]
+                  problems.append("含非 ASCII 字符（位置 %s，多为全角字符/中文说明/零宽字符）" % bad[:5])
+              if "feishu.cn" not in url and "larksuite.com" not in url:
+                  problems.append("域名不是飞书 open.feishu.cn / open.larksuite.com")
+              if "/hook/" not in url:
+                  problems.append("缺少 /hook/ 路径")
+              if len(url) < 60:
+                  problems.append("长度只有 %d，疑似被截断（完整地址通常 80 字符以上）" % len(url))
+
+          if problems:
+              print("WEBHOOK_INVALID: " + "；".join(problems))
+              print("length: %d" % len(url))
+              sys.exit(1)
+
+          payload = json.dumps({"msg_type": "text", "content": {"text": text}}).encode("utf-8")
+          last = ""
+          for attempt in range(1, 4):
+              req = urllib.request.Request(url, data=payload, headers={"Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req, timeout=20) as resp:
+                      status = resp.status
+                      body = resp.read().decode("utf-8", "replace")
+                  compact = body.replace(" ", "")
+                  ok = status == 200 and ('"code":0' in compact or '"StatusCode":0' in compact)
+                  print("feishu status", status, body[:200])
+                  if ok:
+                      print("OK 通知已送达")
+                      sys.exit(0)
+                  last = "HTTP %s: %s" % (status, body[:200])
+              except Exception as exc:
+                  last = str(exc)
+                  print("attempt %d failed: %s" % (attempt, exc))
+              time.sleep(3 * attempt)
+          print("FEISHU_SEND_FAILED: " + last)
+          sys.exit(1)
           PY
