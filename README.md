@@ -104,6 +104,56 @@ Actions → **Auto Reading Bot** → 右侧 **Run workflow** → 「阅读时长
 
 ---
 
+## 二·五、每周阅读奖励（每周日自动领取）
+
+「我的阅读」里的时长/天数阶梯奖励（读 5 分钟 → 体验卡/书币……）现在由 GitHub Actions **每周日北京时间 09:40 自动领取**，领完发飞书通知。
+
+### 一次性准备（约 1 分钟）
+
+1. 本地仓库目录执行：
+
+   ```bash
+   python weread-bot.py --weekly-login --weekly-creds-out weekly_creds.json
+   ```
+
+2. 终端会打印二维码路径，用**微信扫一扫**并确认登录（二维码 5 分钟有效）；
+3. 生成的 `weekly_creds.json` 内容整段复制，填入仓库
+   `Settings → Secrets and variables → Actions → New repository secret`，
+   名称 **`WEREAD_WEEKLY_CREDS`**（该文件已在 `.gitignore` 中，不会被提交）。
+
+### 运行方式
+
+```bash
+# 只读查询（不领取，安全，可随时看状态）
+python weread-bot.py --weekly-rewards-query
+
+# 立即领取（周日自动跑的就是这条）
+python weread-bot.py --weekly-rewards
+```
+
+GitHub Actions 里：`Auto Reading Bot` 工作流的 `weekly-rewards` 任务，定时 `cron: '40 1 * * 0'`（UTC）= 北京时间周日 09:40；也可在 Actions 页面手动触发，勾选 **run_weekly_rewards**。
+
+### 领取规则
+
+| 情况 | 行为 |
+| --- | --- |
+| `awardStatus = 1`（可领） | 自动领取 |
+| 书币 ≥ 2 枚 | 优先领书币 |
+| 否则 | 领体验卡（天） |
+| `awardStatus = 2`（已领） | 跳过，不重复领 |
+| 未达标（差时长/差天数） | 跳过，通知里列出还差多少 |
+| 想改成优先体验卡 | 加 Secret `WEREAD_WEEKLY_PREFER=card` |
+
+### 失效自愈
+
+- 移动端 `accessToken` 过期时，程序自动用 `refreshToken` 换新令牌（`POST /login`），**无需重新扫码**；
+- 换到的新 `refreshToken` 会立刻写回 Secret `WEREAD_WEEKLY_CREDS`（复用 `WEREAD_SECRET_SYNC_TOKEN`），下次直接可用；
+- 只有 `refreshToken` 也彻底失效时才会发飞书告警，并提示「运行 `--weekly-login` 重新扫码」。
+
+> 接口：`POST https://i.weread.qq.com/weekly/exchange`，认证头为 `vid` + `accessToken`（移动端凭证，与网页 Cookie 不通用）。
+
+---
+
 ## 三、本地运行（可选）
 
 ```bash

@@ -4916,6 +4916,743 @@ def setup_logging(logging_config: LoggingConfig = None, verbose: bool = False):
     )
 
 
+
+# ============================================================================
+# fork 定制：我的阅读 · 每周阅读奖励（weekly/exchange）
+# ----------------------------------------------------------------------------
+# 端点: POST https://i.weread.qq.com/weekly/exchange
+# 认证: 请求头 vid + accessToken（移动端凭证，与网页 wr_skey 不同源）
+# 查询: {"awardLevelId":0,"unread":0,"isExchangeAward":0,"pf":...,"isVisitReadGoal":1,"awardChoiceType":0}
+# 领取: {"unread":1,"awardChoiceType":<1|2>,"pf":...,"awardLevelId":<id>,"isExchangeAward":1}
+# awardStatus: 0=未达标 1=可领取 2=已领取
+# awardChoices[].choiceType: 1=体验卡(天) 2=书币(枚)
+# 续期: POST https://i.weread.qq.com/login (refreshToken + sha256 签名)
+# ============================================================================
+
+WEEKLY_EXCHANGE_URL = "https://i.weread.qq.com/weekly/exchange"
+WEEKLY_LOGIN_URL = "https://i.weread.qq.com/login"
+WEEKLY_PF = "weread_wx-2001-iap-2001-iphone"
+ENV_WEEKLY_CREDS = "WEREAD_WEEKLY_CREDS"
+ENV_WEEKLY_CREDS_OUT = "WEREAD_WEEKLY_CREDS_OUT"
+ENV_WEEKLY_CREDS_SECRET = "WEREAD_WEEKLY_CREDS_SECRET_NAME"
+ENV_WEEKLY_PREFER = "WEREAD_WEEKLY_PREFER"
+DEFAULT_WEEKLY_CREDS_SECRET = "WEREAD_WEEKLY_CREDS"
+WEEKLY_AWARD_CLAIMABLE = 1
+WEEKLY_AWARD_CLAIMED = 2
+WEEKLY_APP_HEADERS = {
+    "baseapi": "30",
+    "appver": "2.1.2.10245900",
+    "basever": "2.1.2.10245900",
+    "osver": "11",
+    "channelId": "900",
+    "User-Agent": (
+        "WeRead/2.1.2 WRBrand/Onyx wr_eink Dalvik/2.1.0 "
+        "(Linux; U; Android 11; BOOX Build/onyx)"
+    ),
+}
+WEEKLY_AWARD_GROUPS: Tuple[Tuple[str, str], ...] = (
+    ("readtimeAwards", "阅读时长"),
+    ("readdayAwards", "阅读天数"),
+    ("readgoalAwards", "阅读目标"),
+)
+
+
+class WeeklyRewardError(RuntimeError):
+    """每周奖励接口/凭证异常"""
+
+    def __init__(self, message: str, errcode: Optional[int] = None) -> None:
+        super().__init__(message)
+        self.errcode = errcode
+
+    @property
+    def is_auth_error(self) -> bool:
+        return self.errcode in (-2012, -2010, -2003, 401)
+
+
+@dataclass
+class WeeklyRewardCreds:
+    """移动端凭证（vid / accessToken / refreshToken / deviceId）"""
+
+    vid: str = ""
+    access_token: str = ""
+    refresh_token: str = ""
+    device_id: str = ""
+    device_name: str = "BOOX"
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "vid": self.vid,
+                "accessToken": self.access_token,
+                "refreshToken": self.refresh_token,
+                "deviceId": self.device_id,
+                "deviceName": self.device_name,
+            },
+            ensure_ascii=False,
+        )
+
+    @classmethod
+    def from_json(cls, raw: str) -> "WeeklyRewardCreds":
+        data = json.loads(raw)
+        if not isinstance(data, dict):
+            raise WeeklyRewardError("凭证不是 JSON 对象")
+        creds = cls(
+            vid=str(data.get("vid") or ""),
+            access_token=str(
+                data.get("accessToken") or data.get("access_token") or ""
+            ),
+            refresh_token=str(
+                data.get("refreshToken") or data.get("refresh_token") or ""
+            ),
+            device_id=str(data.get("deviceId") or data.get("device_id") or ""),
+            device_name=str(data.get("deviceName") or "BOOX"),
+        )
+        if not creds.vid or not creds.access_token:
+            raise WeeklyRewardError("凭证缺少 vid 或 accessToken")
+        return creds
+
+
+def load_weekly_creds() -> WeeklyRewardCreds:
+    """从环境变量读取移动端凭证（也支持本地文件路径）。"""
+    raw = (os.getenv(ENV_WEEKLY_CREDS) or "").strip()
+    if not raw:
+        raise WeeklyRewardError(
+            f"未配置 {ENV_WEEKLY_CREDS}（需要 vid/accessToken/refreshToken 的 JSON）"
+        )
+    if not raw.startswith("{"):
+        path = Path(raw)
+        if not path.exists():
+            raise WeeklyRewardError(f"{ENV_WEEKLY_CREDS} 指向的文件不存在")
+        raw = path.read_text(encoding="utf-8").strip()
+    return WeeklyRewardCreds.from_json(raw)
+
+
+def persist_weekly_creds(creds: WeeklyRewardCreds) -> str:
+    """把续期后的凭证写回本地文件，并在 Actions 中回写 Secret。"""
+    payload = creds.to_json()
+    out_path = (os.getenv(ENV_WEEKLY_CREDS_OUT) or "").strip()
+    if out_path:
+        try:
+            Path(out_path).write_text(payload, encoding="utf-8")
+            os.chmod(out_path, 0o600)
+            logging.info("✅ 续期后的凭证已写入 %s", out_path)
+        except OSError as exc:
+            logging.warning("⚠️ 写入续期凭证失败: %s", exc)
+
+    if not (os.getenv("GITHUB_ACTIONS") or "").strip():
+        return "skipped:not_in_actions"
+
+    token = (
+        os.getenv("WEREAD_SECRET_SYNC_TOKEN")
+        or os.getenv("GITHUB_TOKEN")
+        or ""
+    )
+    repo = (os.getenv("GITHUB_REPOSITORY") or "").strip()
+    api_url = (os.getenv("GITHUB_API_URL") or "https://api.github.com").strip()
+    secret_name = (
+        os.getenv(ENV_WEEKLY_CREDS_SECRET) or DEFAULT_WEEKLY_CREDS_SECRET
+    ).strip()
+    if not token or not repo:
+        return "skipped:no_github_credentials"
+    try:
+        from weread_cookie_healer import GitHubSecretClient
+    except Exception as exc:  # pragma: no cover - 依赖缺失
+        logging.warning("⚠️ 无法导入 Secret 客户端: %s", exc)
+        return "skipped:import_failed"
+    try:
+        GitHubSecretClient(token, repo, api_url).update_secret(
+            secret_name, payload
+        )
+    except Exception as exc:
+        logging.warning("⚠️ 回写 Secret %s 失败: %s", secret_name, exc)
+        return f"failed:{exc}"[:160]
+    logging.info("✅ 续期后的凭证已回写 Secret '%s'", secret_name)
+    return "synced"
+
+
+class WeeklyRewardClient:
+    """每周阅读奖励接口客户端"""
+
+    def __init__(
+        self, creds: WeeklyRewardCreds, timeout: int = 30
+    ) -> None:
+        if requests is None:
+            raise WeeklyRewardError("缺少依赖 requests，无法领取每周奖励")
+        self.creds = creds
+        self.timeout = timeout
+
+    def _headers(self) -> Dict[str, str]:
+        headers = dict(WEEKLY_APP_HEADERS)
+        headers["vid"] = self.creds.vid
+        headers["accessToken"] = self.creds.access_token
+        return headers
+
+    def _post_json(self, url: str, body: Dict[str, Any]) -> Dict[str, Any]:
+        try:
+            response = requests.post(
+                url, headers=self._headers(), json=body, timeout=self.timeout
+            )
+        except Exception as exc:
+            raise WeeklyRewardError(
+                f"请求 {urllib.parse.urlsplit(url).netloc} 失败: "
+                f"{type(exc).__name__}"
+            ) from exc
+
+        raw = (response.text or "").strip()
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise WeeklyRewardError(
+                f"响应不是合法 JSON（HTTP {response.status_code}）"
+            ) from exc
+        if not isinstance(payload, dict):
+            raise WeeklyRewardError("响应结构异常（不是对象）")
+
+        errcode = payload.get("errcode")
+        try:
+            code = int(errcode) if errcode is not None else 0
+        except (TypeError, ValueError):
+            code = 0
+        if code != 0:
+            raise WeeklyRewardError(
+                str(payload.get("errmsg") or f"errcode={code}"), errcode=code
+            )
+        return payload
+
+    def query(self) -> Dict[str, Any]:
+        """只读查询，返回奖励列表"""
+        return self._post_json(
+            WEEKLY_EXCHANGE_URL,
+            {
+                "awardLevelId": 0,
+                "unread": 0,
+                "isExchangeAward": 0,
+                "pf": WEEKLY_PF,
+                "isVisitReadGoal": 1,
+                "awardChoiceType": 0,
+            },
+        )
+
+    def claim(self, level_id: int, choice_type: int) -> Dict[str, Any]:
+        """领取单个奖励等级"""
+        return self._post_json(
+            WEEKLY_EXCHANGE_URL,
+            {
+                "unread": 1,
+                "awardChoiceType": choice_type,
+                "pf": WEEKLY_PF,
+                "awardLevelId": level_id,
+                "isExchangeAward": 1,
+            },
+        )
+
+    def refresh(self) -> WeeklyRewardCreds:
+        """用 refreshToken 换新的 accessToken"""
+        if not self.creds.refresh_token:
+            raise WeeklyRewardError("缺少 refreshToken，需要重新扫码登录")
+        if not self.creds.device_id:
+            raise WeeklyRewardError("缺少 deviceId，需要重新扫码登录")
+        ts = int(time.time() * 1000)
+        rnd = random.randint(1, 1000)
+        signature = hashlib.sha256(
+            f"{ts}{self.creds.device_id}{rnd}".encode()
+        ).hexdigest()
+        payload = self._post_json(
+            WEEKLY_LOGIN_URL,
+            {
+                "deviceId": self.creds.device_id,
+                "deviceName": self.creds.device_name or "BOOX",
+                "inBackground": 0,
+                "kickType": 1,
+                "random": rnd,
+                "refCgi": "",
+                "refreshToken": self.creds.refresh_token,
+                "signature": signature,
+                "timestamp": ts,
+                "trackId": "",
+                "deviceType": 3,
+            },
+        )
+        access_token = payload.get("accessToken")
+        if not access_token:
+            raise WeeklyRewardError("续期响应缺少 accessToken")
+        refreshed = WeeklyRewardCreds(
+            vid=str(payload.get("vid") or self.creds.vid),
+            access_token=str(access_token),
+            refresh_token=str(
+                payload.get("refreshToken") or self.creds.refresh_token
+            ),
+            device_id=self.creds.device_id,
+            device_name=self.creds.device_name,
+        )
+        self.creds = refreshed
+        logging.info("🔄 移动端凭证已自动续期")
+        return refreshed
+
+
+def _weekly_as_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def collect_weekly_awards(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """把响应里的三类奖励拍平成统一结构列表"""
+    awards: List[Dict[str, Any]] = []
+    for key, label in WEEKLY_AWARD_GROUPS:
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        for raw in items:
+            if not isinstance(raw, dict):
+                continue
+            level_id = _weekly_as_int(raw.get("awardLevelId"), 0)
+            if level_id <= 0:
+                continue
+            choices = [
+                choice
+                for choice in (raw.get("awardChoices") or [])
+                if isinstance(choice, dict)
+            ]
+            awards.append(
+                {
+                    "group": label,
+                    "level_id": level_id,
+                    "desc": str(
+                        raw.get("awardLevelDesc")
+                        or raw.get("awardLevelName")
+                        or f"等级 {level_id}"
+                    ).strip(),
+                    "status": _weekly_as_int(raw.get("awardStatus"), 0),
+                    "choices": choices,
+                }
+            )
+    return awards
+
+
+def choose_weekly_award_choice(
+    choices: List[Dict[str, Any]]
+) -> Optional[Dict[str, Any]]:
+    """按「书币 >= 2 优先书币，否则体验卡」的规则挑一种奖励形式"""
+    if not choices:
+        return None
+    prefer = (os.getenv(ENV_WEEKLY_PREFER) or "coin").strip().lower()
+    coins = [
+        choice
+        for choice in choices
+        if _weekly_as_int(choice.get("choiceType"), 0) == 2
+    ]
+    cards = [
+        choice
+        for choice in choices
+        if _weekly_as_int(choice.get("choiceType"), 0) == 1
+    ]
+    best_coin = max(
+        coins, key=lambda c: _weekly_as_int(c.get("awardNum"), 0), default=None
+    )
+    if prefer == "card" and cards:
+        return cards[0]
+    if best_coin and _weekly_as_int(best_coin.get("awardNum"), 0) >= 2:
+        return best_coin
+    if cards:
+        return cards[0]
+    return best_coin or choices[0]
+
+
+def describe_weekly_choice(choice: Optional[Dict[str, Any]]) -> str:
+    """把奖励形式转成中文描述"""
+    if not choice:
+        return "默认奖励"
+    choice_type = _weekly_as_int(choice.get("choiceType"), 0)
+    amount = _weekly_as_int(choice.get("awardNum"), 0)
+    if choice_type == 2:
+        return f"书币 ×{amount}"
+    if choice_type == 1:
+        return f"体验卡 ×{amount} 天"
+    return str(choice.get("choiceDesc") or "奖励")
+
+
+def build_weekly_report(
+    claimed: List[str],
+    pending: List[str],
+    claimed_before: int,
+    status_text: str,
+    claimable_now: Optional[List[str]] = None,
+) -> str:
+    """构造飞书/通知文案"""
+    lines = ["📚 微信读书 · 每周阅读奖励", f"结论：{status_text}"]
+    if claimed:
+        lines.append(f"本次领取 {len(claimed)} 项：")
+        lines.extend(f"· {item}" for item in claimed)
+    elif claimable_now:
+        lines.append(f"查询到 {len(claimable_now)} 项可领取（只读模式未执行领取）：")
+        lines.extend(f"· {item}" for item in claimable_now)
+    elif claimed_before:
+        lines.append(f"本周 {claimed_before} 项奖励此前已领取，无需重复操作")
+    else:
+        lines.append("本周暂无可领取奖励")
+    if pending:
+        lines.append("尚未达标：")
+        lines.extend(f"· {item}" for item in pending[:6])
+    lines.append("⏰ 每周日 09:40（北京时间）自动执行")
+    return "\n".join(lines)
+
+
+def weekly_repair_guide() -> str:
+    """凭证失效时的恢复指引"""
+    return (
+        "🔧 移动端凭证已失效，需要重新扫码（约 1 分钟）：\n"
+        "1. 在本地仓库目录运行 `python weread-bot.py --weekly-login`；\n"
+        "2. 微信扫描生成的二维码并确认登录；\n"
+        "3. 把生成的 weekly_creds.json 内容填入仓库 Secret "
+        f"{DEFAULT_WEEKLY_CREDS_SECRET}。"
+    )
+
+
+def run_weekly_rewards(
+    notification_service: Optional["NotificationService"] = None,
+    query_only: bool = False,
+) -> int:
+    """查询并领取每周阅读奖励，返回进程退出码"""
+    logging.info("🎁 每周阅读奖励任务开始%s", "（只读查询）" if query_only else "")
+    try:
+        creds = load_weekly_creds()
+    except WeeklyRewardError as exc:
+        message = f"❌ 每周奖励未执行：{exc}\n\n{weekly_repair_guide()}"
+        logging.error("%s", message)
+        _notify_weekly(notification_service, message)
+        return 1
+
+    client = WeeklyRewardClient(creds)
+    try:
+        payload = client.query()
+    except WeeklyRewardError as exc:
+        if not exc.is_auth_error:
+            message = f"❌ 每周奖励查询失败：{exc}"
+            logging.error("%s", message)
+            _notify_weekly(notification_service, message)
+            return 1
+        logging.warning("⚠️ 凭证已过期（%s），尝试自动续期", exc)
+        try:
+            refreshed = client.refresh()
+            persist_weekly_creds(refreshed)
+            payload = client.query()
+        except WeeklyRewardError as refresh_error:
+            message = (
+                f"❌ 每周奖励未执行：凭证失效且自动续期失败（{refresh_error}）"
+                f"\n\n{weekly_repair_guide()}"
+            )
+            logging.error("%s", message)
+            _notify_weekly(notification_service, message)
+            return 1
+
+    awards = collect_weekly_awards(payload)
+    claimable = [
+        award for award in awards if award["status"] == WEEKLY_AWARD_CLAIMABLE
+    ]
+    already = [
+        award for award in awards if award["status"] == WEEKLY_AWARD_CLAIMED
+    ]
+    pending = [
+        award
+        for award in awards
+        if award["status"] not in (WEEKLY_AWARD_CLAIMABLE, WEEKLY_AWARD_CLAIMED)
+    ]
+    logging.info(
+        "📊 奖励状态：可领 %s 项 / 已领 %s 项 / 未达标 %s 项",
+        len(claimable),
+        len(already),
+        len(pending),
+    )
+    for award in awards:
+        logging.info(
+            "  · [%s] %s → 状态=%s 可选项=%s",
+            award["group"],
+            award["desc"],
+            award["status"],
+            ", ".join(
+                describe_weekly_choice(choice) for choice in award["choices"]
+            )
+            or "无",
+        )
+
+    pending_lines = [
+        f"{award['desc']}（{award['group']}）" for award in pending
+    ]
+
+    if query_only or not claimable:
+        status_text = (
+            "只读查询完成"
+            if query_only
+            else ("本周已全部领取" if already else "本周暂无可领奖励")
+        )
+        claimable_lines = [
+            f"{award['desc']} → "
+            f"{describe_weekly_choice(choose_weekly_award_choice(award['choices']))}"
+            for award in claimable
+        ]
+        message = build_weekly_report(
+            [], pending_lines, len(already), status_text, claimable_lines
+        )
+        logging.info("%s", message)
+        _notify_weekly(notification_service, message)
+        return 0
+
+    claimed_lines: List[str] = []
+    failures: List[str] = []
+    for award in claimable:
+        choice = choose_weekly_award_choice(award["choices"])
+        choice_type = (
+            _weekly_as_int(choice.get("choiceType"), 0) if choice else 0
+        )
+        choice_text = describe_weekly_choice(choice)
+        try:
+            result = client.claim(award["level_id"], choice_type)
+        except WeeklyRewardError as exc:
+            if exc.is_auth_error:
+                logging.warning("⚠️ 领取过程中凭证失效（%s），续期后重试", exc)
+                try:
+                    persisted = client.refresh()
+                    persist_weekly_creds(persisted)
+                    result = client.claim(award["level_id"], choice_type)
+                except WeeklyRewardError as retry_error:
+                    failures.append(f"{award['desc']}：{retry_error}")
+                    continue
+            else:
+                failures.append(f"{award['desc']}：{exc}")
+                continue
+
+        status_after = _weekly_award_status_after_claim(result, award)
+        if status_after == WEEKLY_AWARD_CLAIMED:
+            claimed_lines.append(f"{award['desc']} → {choice_text} ✅")
+            logging.info("✅ 已领取：%s → %s", award["desc"], choice_text)
+        else:
+            failures.append(f"{award['desc']}：返回状态 {status_after}")
+            logging.warning(
+                "⚠️ 领取未确认：%s（返回状态 %s）", award["desc"], status_after
+            )
+
+    if claimed_lines:
+        status_text = f"✅ 成功领取 {len(claimed_lines)} 项"
+    else:
+        status_text = "⚠️ 全部领取失败"
+    if failures:
+        status_text += f"，{len(failures)} 项失败"
+
+    message = build_weekly_report(
+        claimed_lines, pending_lines, len(already), status_text
+    )
+    if failures:
+        message += "\n失败明细：\n" + "\n".join(
+            f"· {item}" for item in failures
+        )
+    logging.info("%s", message)
+    _notify_weekly(notification_service, message)
+    return 0 if claimed_lines or not failures else 1
+
+
+def _weekly_award_status_after_claim(
+    payload: Dict[str, Any], award: Dict[str, Any]
+) -> int:
+    """领取响应里确认该等级是否已变为已领取"""
+    for item in collect_weekly_awards(payload):
+        if item["level_id"] == award["level_id"]:
+            return item["status"]
+    return WEEKLY_AWARD_CLAIMED if payload else 0
+
+
+def _notify_weekly(
+    notification_service: Optional["NotificationService"], message: str
+) -> None:
+    """发送每周奖励通知（失败不影响主流程）"""
+    if not notification_service:
+        return
+    try:
+        notification_service.send_notification(
+            message, event=NotificationEvent.GENERAL
+        )
+    except Exception as exc:  # pragma: no cover - 通知失败不影响领取
+        logging.warning("⚠️ 每周奖励通知发送失败: %s", exc)
+
+
+
+def run_weekly_login(
+    output_path: str = "weekly_creds.json",
+    timeout_seconds: int = 300,
+    qr_path: str = "",
+) -> int:
+    """扫码登录换取移动端凭证（vid / accessToken / refreshToken）。
+
+    仅拿凭证时用一次；之后每周任务会自动续期，无需重复扫码。
+    """
+    if requests is None:
+        print("❌ 缺少依赖 requests")
+        return 1
+
+    session = requests.Session()
+    headers = dict(WEEKLY_APP_HEADERS)
+    try:
+        ticket_resp = session.get(
+            "https://i.weread.qq.com/wxticket?nonceStr=weread",
+            headers=headers,
+            timeout=30,
+        )
+        ticket = ticket_resp.json()
+        qr_resp = session.get(
+            "https://open.weixin.qq.com/connect/sdk/qrconnect",
+            params={
+                "appid": "wxab9b71ad2b90ff34",
+                "noncestr": "weread",
+                "timestamp": str(ticket["timeStamp"]),
+                "scope": "snsapi_userinfo,snsapi_timeline,snsapi_friend",
+                "signature": ticket["signature"],
+            },
+            headers={"User-Agent": WEEKLY_APP_HEADERS["User-Agent"]},
+            timeout=30,
+        )
+        qr_data = qr_resp.json()
+    except Exception as exc:
+        print(f"❌ 获取二维码失败: {type(exc).__name__}")
+        return 1
+    if _weekly_as_int(qr_data.get("errcode"), -1) != 0:
+        print(f"❌ 二维码接口异常: {qr_data.get('errmsg') or qr_data}")
+        return 1
+
+    uuid_value = str(qr_data.get("uuid") or "")
+    encoded = str((qr_data.get("qrcode") or {}).get("qrcodebase64") or "")
+    if not uuid_value or not encoded:
+        print("❌ 二维码数据不完整")
+        return 1
+
+    import base64
+
+    image_bytes = base64.b64decode(encoded.replace("\\/", "/"))
+    qr_file = Path(qr_path or os.path.join(tempfile.gettempdir(), "weread_weekly_qr.jpg"))
+    qr_file.write_bytes(image_bytes)
+    print(f"QR_READY {qr_file}", flush=True)
+    print("👉 用微信扫一扫上面的二维码并在手机上确认登录（5 分钟内有效）", flush=True)
+
+    deadline = time.time() + timeout_seconds
+    last_code = -1
+    wx_code = ""
+    while time.time() < deadline:
+        params = {"f": "json", "uuid": uuid_value}
+        if last_code >= 0:
+            params["last"] = str(last_code)
+        try:
+            poll = session.get(
+                "https://long.open.weixin.qq.com/connect/l/qrconnect",
+                params=params,
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=70,
+            )
+            text = (poll.text or "").strip()
+        except Exception:
+            time.sleep(1)
+            continue
+        match_code = re.search(r"wx_errcode\s*=\s*(\d+)", text)
+        match_wx = re.search(r"wx_code\s*=\s*'([^']*)'", text)
+        if match_code:
+            errcode = int(match_code.group(1))
+            wx_code = match_wx.group(1) if match_wx else ""
+        else:
+            try:
+                parsed = json.loads(text)
+            except ValueError:
+                continue
+            errcode = _weekly_as_int(parsed.get("wx_errcode"), 0)
+            wx_code = str(parsed.get("wx_code") or "")
+        if errcode == 405 and wx_code:
+            break
+        if errcode == 404:
+            print("… 已扫码，等待手机确认")
+        elif errcode == 402:
+            print("❌ 二维码已过期，请重新运行")
+            return 2
+        elif errcode == 403:
+            print("❌ 手机端取消了登录")
+            return 3
+        last_code = errcode
+    if not wx_code:
+        print("❌ 扫码超时，请重新运行")
+        return 4
+
+    device_file = Path(output_path).with_suffix(".device")
+    device_id = ""
+    if device_file.exists():
+        device_id = device_file.read_text(encoding="utf-8").strip()
+    if not device_id:
+        device_id = "eink334691225%019d" % random.getrandbits(63)
+        device_file.write_text(device_id, encoding="utf-8")
+        try:
+            os.chmod(device_file, 0o600)
+        except OSError:
+            pass
+
+    timestamp = int(time.time() * 1000)
+    random_value = random.randrange(0, 1000)
+    signature = hashlib.sha256(
+        f"{timestamp}{device_id}{random_value}".encode()
+    ).hexdigest()
+    login_body = {
+        "appFirstInstall": 1,
+        "code": wx_code,
+        "deviceId": device_id,
+        "deviceName": "BOOX",
+        "installId": "eink31"
+        + "".join(random.choice("0123456789") for _ in range(26)),
+        "isAutoLogout": 0,
+        "isFromQrcode": 1,
+        "random": random_value,
+        "signature": signature,
+        "timestamp": timestamp,
+        "trackId": "",
+        "deviceType": 3,
+    }
+    try:
+        login_resp = session.post(
+            WEEKLY_LOGIN_URL, headers=headers, json=login_body, timeout=40
+        )
+        login_data = login_resp.json()
+    except Exception as exc:
+        print(f"❌ 登录请求失败: {type(exc).__name__}")
+        return 5
+    access_token = str(login_data.get("accessToken") or "")
+    if not access_token:
+        print(f"❌ 登录失败: {login_data.get('errmsg') or '未返回 accessToken'}")
+        return 6
+
+    creds = WeeklyRewardCreds(
+        vid=str(login_data.get("vid") or ""),
+        access_token=access_token,
+        refresh_token=str(login_data.get("refreshToken") or ""),
+        device_id=device_id,
+        device_name="BOOX",
+    )
+    target = Path(output_path)
+    target.write_text(creds.to_json(), encoding="utf-8")
+    try:
+        os.chmod(target, 0o600)
+    except OSError:
+        pass
+    print(f"LOGIN_OK {target}")
+    print(
+        "✅ 凭证已保存：vid %s 位 / accessToken %s 位 / refreshToken %s 位"
+        % (len(creds.vid), len(creds.access_token), len(creds.refresh_token))
+    )
+    print(f"👉 请把文件内容填入仓库 Secret {DEFAULT_WEEKLY_CREDS_SECRET}")
+    return 0
+
+def _parse_weekly_creds_for_check(raw: str) -> str:
+    """校验凭证 JSON 是否可用（仅用于诊断输出，不泄露内容）"""
+    creds = WeeklyRewardCreds.from_json(raw)
+    return (
+        f"vid={len(creds.vid)} 位，accessToken={len(creds.access_token)} 位，"
+        f"refreshToken={len(creds.refresh_token)} 位，"
+        f"deviceId={len(creds.device_id)} 位"
+    )
+
 def parse_arguments(argv: Optional[List[str]] = None):
     """解析命令行参数"""
     parser = argparse.ArgumentParser(
@@ -4968,6 +5705,30 @@ def parse_arguments(argv: Optional[List[str]] = None):
         "--show-last-run",
         action="store_true",
         help="显示最近一次真实执行结果并退出"
+    )
+
+    parser.add_argument(
+        "--weekly-rewards",
+        action="store_true",
+        help="查询并领取「我的阅读」每周阅读奖励后退出"
+    )
+
+    parser.add_argument(
+        "--weekly-rewards-query",
+        action="store_true",
+        help="只查询每周阅读奖励状态，不领取"
+    )
+
+    parser.add_argument(
+        "--weekly-login",
+        action="store_true",
+        help="扫码登录并导出移动端凭证（用于每周阅读奖励）"
+    )
+
+    parser.add_argument(
+        "--weekly-creds-out",
+        default="weekly_creds.json",
+        help="扫码登录后凭证保存路径 (默认: weekly_creds.json)"
     )
 
     return parser.parse_args(argv)
@@ -5105,6 +5866,19 @@ async def main() -> int:
         if args.mode:
             config.startup_mode = args.mode
             logging.info(f"🔧 命令行参数覆盖启动模式: {args.mode}")
+
+        # fork 定制：每周阅读奖励 / 扫码登录等无阅读模式
+        if getattr(args, "weekly_login", False):
+            return run_weekly_login(getattr(args, "weekly_creds_out", "weekly_creds.json"))
+
+        if getattr(args, "weekly_rewards", False) or getattr(
+            args, "weekly_rewards_query", False
+        ):
+            notification_service = NotificationService(config.notification)
+            return run_weekly_rewards(
+                notification_service,
+                query_only=bool(getattr(args, "weekly_rewards_query", False)),
+            )
 
         _validate_runtime_config(config)
 

@@ -228,3 +228,7 @@ __marimo__/
 curl_command.txt
 user_curl*.txt
 cookies/
+
+# fork 定制：每周奖励移动端凭证（本地扫码登录生成，禁止提交）
+weekly_creds.json
+weekly_creds.device

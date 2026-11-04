@@ -4,6 +4,7 @@ on:
   # 定时触发：每天北京时间 09:00（UTC 01:00）运行
   schedule:
     - cron: '13 1 * * *'   # UTC 01:13 = 北京时间 09:13（避开整点拥堵，减少被跳过/延迟）
+    - cron: '40 1 * * 0'   # UTC 01:40 = 北京时间周日 09:40（每周阅读奖励，同样避开整点）
 
   # 拉取请求触发，用于测试阅读
   pull_request:
@@ -51,9 +52,16 @@ on:
         required: false
         default: '50'
         type: string
+      run_weekly_rewards:
+        description: '只运行「每周阅读奖励」领取（不跑阅读）'
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   auto-reading:
+    # 周日 09:40 的定时只跑每周奖励，跳过阅读任务
+    if: github.event_name != 'schedule' || github.event.schedule != '40 1 * * 0'
     runs-on: ubuntu-latest
     timeout-minutes: 120  # 2小时超时
 
@@ -231,5 +239,53 @@ jobs:
         path: |
           logs/weread.log
           logs/run-history.json
+        if-no-files-found: warn
+        retention-days: 7
+
+  weekly-rewards:
+    # 每周日 09:40（北京时间）领取「我的阅读」时长/天数奖励；也可手动触发
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule == '40 1 * * 0')
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.run_weekly_rewards == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v5
+
+    - name: Set up Python 3.11
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+
+    - name: Run weekly rewards
+      env:
+        # 移动端凭证（vid / accessToken / refreshToken 的 JSON），由扫码登录生成
+        WEREAD_WEEKLY_CREDS: ${{ secrets.WEREAD_WEEKLY_CREDS }}
+        # 续期后的新凭证落盘 + 回写 Secret，避免下次失效
+        WEREAD_WEEKLY_CREDS_OUT: ${{ github.workspace }}/logs/weekly_creds.json
+        WEREAD_WEEKLY_CREDS_SECRET_NAME: ${{ secrets.WEREAD_WEEKLY_CREDS_SECRET_NAME || 'WEREAD_WEEKLY_CREDS' }}
+        WEREAD_SECRET_SYNC_TOKEN: ${{ secrets.WEREAD_SECRET_SYNC_TOKEN }}
+        GITHUB_TOKEN: ${{ github.token }}
+        FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+        FEISHU_MSG_TYPE: ${{ secrets.FEISHU_MSG_TYPE }}
+        TZ: 'Asia/Shanghai'
+      run: |
+        mkdir -p logs
+        echo "每周奖励任务开始: $(date)"
+        python weread-bot.py --weekly-rewards
+
+    - name: Upload weekly logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: weread-weekly-${{ github.run_id }}
+        path: logs/
         if-no-files-found: warn
         retention-days: 7
