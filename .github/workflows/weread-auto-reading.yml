@@ -60,8 +60,12 @@ on:
 
 jobs:
   auto-reading:
-    # 周日 09:40 的定时只跑每周奖励，跳过阅读任务
-    if: github.event_name != 'schedule' || github.event.schedule != '40 1 * * 0'
+    # 周日 09:40 的定时、以及手动勾选「只跑每周奖励」时，跳过阅读任务
+    if: |
+      (github.event_name == 'schedule' && github.event.schedule != '40 1 * * 0')
+      || (github.event_name == 'workflow_dispatch' && github.event.inputs.run_weekly_rewards != 'true')
+      || (github.event_name == 'pull_request')
+      || (github.event_name == 'push')
     runs-on: ubuntu-latest
     timeout-minutes: 120  # 2小时超时
 
