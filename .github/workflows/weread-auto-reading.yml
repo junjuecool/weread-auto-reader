@@ -253,6 +253,9 @@ jobs:
       || (github.event_name == 'workflow_dispatch' && github.event.inputs.run_weekly_rewards == 'true')
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    permissions:
+      contents: read
+      issues: write
 
     steps:
     - name: Checkout code
@@ -284,6 +287,27 @@ jobs:
         mkdir -p logs
         echo "每周奖励任务开始: $(date)"
         python weread-bot.py --weekly-rewards
+
+    - name: Alert on failure (GitHub Issue)
+      if: failure()
+      env:
+        GH_TOKEN: ${{ github.token }}
+        RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      run: |
+        cat > /tmp/issue_body.md <<'BODY'
+        每周阅读奖励任务执行失败，需要处理。
+
+        - 运行记录：__RUN_URL__
+        - 修复方式：在本地运行 `python weread-bot.py --weekly-login` 扫码换新凭证，
+          把生成的 weekly_creds.json 内容写入仓库 Secret `WEREAD_WEEKLY_CREDS`。
+        - 修复后可在 Actions 页面手动触发并勾选 `run_weekly_rewards` 验证。
+
+        （本 issue 由工作流自动创建，修复后可关闭）
+        BODY
+        sed -i "s|__RUN_URL__|$RUN_URL|" /tmp/issue_body.md
+        gh issue create --repo "${{ github.repository }}" \
+          --title "每周阅读奖励任务失败 $(date -u +%Y-%m-%d)" \
+          --body-file /tmp/issue_body.md || echo "issue 创建失败，请手动查看运行记录 $RUN_URL"
 
     - name: Upload weekly logs
       if: always()
